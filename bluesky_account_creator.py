@@ -10,13 +10,14 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from atproto import Client
 from dotenv import load_dotenv
 
+from avatar_manager import apply_free_avatar_to_account
 from password_generator import generate_password
 
 
@@ -120,16 +121,19 @@ def create_account(config: AccountConfig, retries: int = 4) -> Dict[str, Any]:
             }
         except Exception as exc:
             msg = str(exc).lower()
-            if any(marker in msg for marker in [
-                "rate limit",
-                "timeout",
-                "temporarily",
-                "429",
-                "network",
-                "connection",
-                "service unavailable",
-                "503",
-            ]):
+            if any(
+                marker in msg
+                for marker in [
+                    "rate limit",
+                    "timeout",
+                    "temporarily",
+                    "429",
+                    "network",
+                    "connection",
+                    "service unavailable",
+                    "503",
+                ]
+            ):
                 attempt += 1
                 wait = min(2 ** attempt, 30)
                 print(f"Transient failure for {config.handle}: {exc}. Retrying in {wait}s...", file=sys.stderr)
@@ -146,6 +150,29 @@ def create_account(config: AccountConfig, retries: int = 4) -> Dict[str, Any]:
     raise RuntimeError(f"Account creation failed after {retries} attempts for {config.handle}")
 
 
+def create_account_with_avatar(
+    config: AccountConfig,
+    avatar_style: str = "avataaars",
+    display_name: str = "",
+    description: str = "",
+    retries: int = 4,
+) -> Dict[str, Any]:
+    created = create_account(config, retries=retries)
+    try:
+        avatar_result = apply_free_avatar_to_account(
+            handle=config.handle,
+            password=config.password,
+            avatar_style=avatar_style,
+            display_name=display_name,
+            description=description,
+            service_url=config.service,
+        )
+        created["avatar"] = avatar_result
+    except Exception as exc:  # pragma: no cover
+        created["avatar"] = {"status": "failed", "error": str(exc)}
+    return created
+
+
 def generate_account_rows(csv_path: str, output_path: str, count: int, password_length: int = 16) -> List[Dict[str, str]]:
     csv_path = Path(csv_path)
     output_path = Path(output_path)
@@ -153,9 +180,10 @@ def generate_account_rows(csv_path: str, output_path: str, count: int, password_
     load_env()
 
     rows: List[Dict[str, str]] = []
-    for _ in range(count):
-        handle = f"user{int(time.time() * 1000) + len(rows)}.bsky.social"
-        email = f"user{int(time.time() * 1000) + len(rows)}@example.com"
+    for i in range(count):
+        unique = int(time.time() * 1000) + i
+        handle = f"user{unique}.bsky.social"
+        email = f"user{unique}@example.com"
         password = generate_password(length=password_length)
         rows.append(
             {
@@ -168,11 +196,7 @@ def generate_account_rows(csv_path: str, output_path: str, count: int, password_
             }
         )
 
-    if csv_path.exists():
-        mode = "a"
-    else:
-        mode = "w"
-
+    mode = "a" if csv_path.exists() else "w"
     fieldnames = ["handle", "email", "password", "invite_code", "verification_code", "status"]
     with csv_path.open(mode, newline="", encoding="utf-8") as handle_file:
         writer = csv.DictWriter(handle_file, fieldnames=fieldnames)
@@ -219,13 +243,15 @@ def create_accounts_from_csv(csv_path: str) -> List[Dict[str, Any]]:
                 result = create_account(config)
                 results.append(result)
             except Exception as exc:
-                results.append({
-                    "status": "failed",
-                    "handle": config.handle,
-                    "email": config.email,
-                    "password": config.password,
-                    "error": str(exc),
-                })
+                results.append(
+                    {
+                        "status": "failed",
+                        "handle": config.handle,
+                        "email": config.email,
+                        "password": config.password,
+                        "error": str(exc),
+                    }
+                )
     return results
 
 
@@ -247,6 +273,9 @@ def main() -> int:
     parser.add_argument("--password", help="Single password")
     parser.add_argument("--invite-code", help="Invite code")
     parser.add_argument("--verification-code", help="Verification code")
+    parser.add_argument("--avatar-style", default="avataaars", help="Free avatar style: avataaars, bottts, identicon, initials, lorelei, pixel-art, micah")
+    parser.add_argument("--display-name", default="", help="Optional display name to set after account creation")
+    parser.add_argument("--description", default="", help="Optional profile description to set after account creation")
     args = parser.parse_args()
 
     try:
@@ -276,7 +305,15 @@ def main() -> int:
             invite_code=args.invite_code,
             verification_code=args.verification_code,
         )
-        result = create_account(config)
+        if args.avatar_style:
+            result = create_account_with_avatar(
+                config,
+                avatar_style=args.avatar_style,
+                display_name=args.display_name,
+                description=args.description,
+            )
+        else:
+            result = create_account(config)
         if args.output:
             export_account_storage([result], args.output)
         print(json.dumps(result, indent=2))
