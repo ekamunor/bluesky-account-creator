@@ -1,2 +1,2 @@
-# bluesky-account-creator
-Bluesky account creation bot and account manager
+atproto>=0.0.51
+python-dotenv>=1.0.0

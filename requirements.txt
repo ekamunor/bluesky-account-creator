@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+from typing import Iterable, List, Optional
+
+from dotenv import load_dotenv
+from atproto import Client
+
+
+@dataclass
+class AccountConfig:
+    handle: str
+    email: str
+    password: str
+    service: str = "https://bsky.social"
+    invite_code: Optional[str] = None
+    verification_code: Optional[str] = None
+
+
+BASIC_EMAIL_RE = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*$"
+)
+
+
+def _env_or_raise(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value.strip()
+
+
+def load_config() -> AccountConfig:
+    load_dotenv(override=False)
+
+    handle = os.getenv("BLUESKY_HANDLE")
+    email = os.getenv("BLUESKY_EMAIL")
+    password = os.getenv("BLUESKY_PASSWORD")
+    service = os.getenv("BLUESKY_SERVICE_URL", "https://bsky.social")
+    invite_code = os.getenv("BLUESKY_INVITE_CODE")
+    verification_code = os.getenv("BLUESKY_VERIFICATION_CODE")
+
+    if not handle or not handle.strip():
+        raise ValueError("BLUESKY_HANDLE is required")
+    if not email or not email.strip():
+        raise ValueError("BLUESKY_EMAIL is required")
+    if not password or not password.strip():
+        raise ValueError("BLUESKY_PASSWORD is required")
+
+    return AccountConfig(
+        handle=handle.strip(),
+        email=email.strip(),
+        password=password.strip(),
+        service=service.strip() or "https://bsky.social",
+        invite_code=invite_code.strip() if invite_code else None,
+        verification_code=verification_code.strip() if verification_code else None,
+    )
+
+
+def validate_email(email: str) -> None:
+    if not BASIC_EMAIL_RE.fullmatch(email):
+        raise ValueError(f"Invalid email format: {email}")
+
+
+def validate_handle(handle: str) -> None:
+    if not handle or " " in handle:
+        raise ValueError(f"Invalid handle: {handle!r}")
+    if "." not in handle:
+        raise ValueError(
+            "Handle must look like a domain or handle identifier, e.g. myname.bsky.social"
+        )
+
+
+def create_account(config: AccountConfig, retries: int = 4):
+    validate_email(config.email)
+    validate_handle(config.handle)
+
+    payload = {
+        "handle": config.handle,
+        "email": config.email,
+        "password": config.password,
+    }
+
+    if config.invite_code:
+        payload["invite_code"] = config.invite_code
+    if config.verification_code:
+        payload["verification_code"] = config.verification_code
+
+    attempt = 0
+    while attempt < retries:
+        try:
+            client = Client()
+            return client.com.atproto.server.create_account(**payload)
+        except Exception as exc:
+            msg = str(exc).lower()
+            retryable = any(
+                marker in msg
+                for marker in [
+                    "rate limit",
+                    "timeout",
+                    "temporarily",
+                    "429",
+                    "network",
+                    "connection",
+                    "service unavailable",
+                    "503",
+                ]
+            )
+            if retryable:
+                attempt += 1
+                wait = min(2 ** attempt, 30)
+                print(f"Transient failure: {exc}. Retrying in {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+                continue
+
+            if any(word in msg for word in ["verification", "email", "invite"]):
+                raise RuntimeError(
+                    "Account setup requires additional verification or an invite code. "
+                    "Check your email verification flow or BLUESKY_INVITE_CODE."
+                ) from exc
+
+            raise
+
+    raise RuntimeError(f"Account creation failed after {retries} attempts")
+
+
+def create_accounts_from_csv(csv_path: str) -> List[dict]:
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    created = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        header = f.readline().strip().lower()
+        required = {"handle", "email", "password"}
+        if not header:
+            raise ValueError("CSV file is empty")
+        columns = [col.strip() for col in header.split(",")]
+        missing = required - set(columns)
+        if missing:
+            raise ValueError(f"CSV missing required columns: {sorted(missing)}")
+
+        for line_number, line in enumerate(f, start=2):
+            raw = [item.strip() for item in line.rstrip("\n").split(",")]
+            if len(raw) < len(columns):
+                raw.extend([""] * (len(columns) - len(raw)))
+            row = dict(zip(columns, raw[: len(columns)]))
+            if not row.get("handle") or not row.get("email") or not row.get("password"):
+                continue
+
+            config = AccountConfig(
+                handle=row["handle"],
+                email=row["email"],
+                password=row["password"],
+                service=os.getenv("BLUESKY_SERVICE_URL", "https://bsky.social"),
+                invite_code=row.get("invite_code") or os.getenv("BLUESKY_INVITE_CODE"),
+                verification_code=row.get("verification_code") or os.getenv("BLUESKY_VERIFICATION_CODE"),
+            )
+            created.append({"line": line_number, "result": create_account(config)})
+
+    return created
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Create Bluesky accounts")
+    parser.add_argument("--csv", help="CSV file containing handle,email,password[,invite_code,verification_code]")
+    parser.add_argument("--handle", help="Single handle for one account creation")
+    parser.add_argument("--email", help="Single email for one account creation")
+    parser.add_argument("--password", help="Single password for one account creation")
+    args = parser.parse_args()
+
+    try:
+        if args.csv:
+            result = create_accounts_from_csv(args.csv)
+            print(result)
+        else:
+            config = AccountConfig(
+                handle=args.handle or os.getenv("BLUESKY_HANDLE", ""),
+                email=args.email or os.getenv("BLUESKY_EMAIL", ""),
+                password=args.password or os.getenv("BLUESKY_PASSWORD", ""),
+                service=os.getenv("BLUESKY_SERVICE_URL", "https://bsky.social"),
+                invite_code=os.getenv("BLUESKY_INVITE_CODE"),
+                verification_code=os.getenv("BLUESKY_VERIFICATION_CODE"),
+            )
+            result = create_account(config)
+            print(result)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
